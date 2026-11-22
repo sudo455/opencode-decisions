@@ -1,5 +1,5 @@
-// Shared Jev decision caller: timeout, answer parsing, and ledger recording.
-const DEFAULT_MODEL = { providerID: "opencode", id: "jev-1.13-free" };
+// Shared decision caller: timeout, answer parsing, and ledger recording.
+import { DEFAULT_MODEL } from "./models.js";
 
 export function answer(answers, name) {
   return Array.isArray(answers) ? answers.find((item) => item && item.name === name) : undefined;
@@ -13,7 +13,7 @@ export async function decide(
   try {
     const pending = ctx.experimental.generate.decisions({ model, input, questions });
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Jev decision timed out")), timeoutMs);
+      timer = setTimeout(() => reject(new Error("Decision timed out")), timeoutMs);
     });
     const result = await Promise.race([pending, timeout]);
     if (ledger) {

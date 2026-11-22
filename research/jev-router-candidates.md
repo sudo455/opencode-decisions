@@ -106,15 +106,20 @@ Conclusion: the free endpoint needs **no** auth header, but rejects any bogus be
 
 ## Outcome
 
-Router = npv12 (effort + subagent models). A separate local `jev-policy` plugin (this repo) uses Jev
-directly for task-type guidance, a risk gate, and agent/skill selection. Both use the OpenCode
-integration credential; both fail open.
+Router = npv12 (effort + subagent models). A separate local `opencode-decisions` plugin (this repo)
+uses decision models directly for task-type guidance, a risk gate, agent/skill selection, a decision
+ledger, and clarification. Both use the OpenCode integration credential; both fail open.
+
+The local plugin was originally named `jev-policy` and was renamed to `opencode-decisions` to match
+the repository. All Jev-specific background lives in this research folder; the plugin itself exposes
+only generic "decision" naming, with model identifiers centralized in
+`plugins/opencode-decisions/lib/models.js`.
 
 Scratch tarballs and unpacked candidate sources remain (gitignored) at
 `/home/dr3ff1c13nt/Projects/github/devops_portainer/.scratch/jev-vet/`; they are not committed here
 to avoid vendoring third-party code.
 
-## Cleanup still open
+## Cleanup completed
 
-`~/.config/opencode/opencode.json.bak-20261122-102645` contains the old revoked plaintext
-`knowledgegraph` Authorization token — delete it. Newer backups do not contain it.
+`~/.config/opencode/opencode.json.bak-20261122-102645` (old revoked plaintext `knowledgegraph`
+Authorization token) was deleted on 2026-11-22. Newer backups never contained it.
