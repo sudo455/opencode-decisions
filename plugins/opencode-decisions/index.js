@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Plugin } from "@opencode/plugin";
+import { makeCache } from "./lib/cache.js";
 import { answer, decide } from "./lib/decide.js";
 import { makeLedger } from "./lib/ledger.js";
 import { DEFAULT_MODEL, ENSEMBLE_MODELS, FALLBACK_MODEL } from "./lib/models.js";
@@ -36,6 +37,16 @@ const DEFAULT_OPTIONS = {
   agentFallback: true,
   highRiskAgent: "plan",
   lowRiskAgent: "build",
+  decisionCache: true,
+  decisionCacheMs: 60000,
+  contextPolicy: true,
+  compactionPolicy: true,
+  retryPolicy: true,
+  postTaskGate: false,
+  postTaskGateMs: 60000,
+  retryDecisionMs: 1200,
+  retryConfidence: 0.6,
+  failureMode: "open",
 };
 
 const TASK_TYPES = ["fix", "feature", "refactor", "review", "docs", "research", "other"];
@@ -55,6 +66,34 @@ const VERIFY_GUIDANCE = {
   standard: "Standard verification: lint + relevant tests + a live probe where applicable.",
   thorough: "Thorough verification: multiple independent passes, including deploy/runtime state and rollback path.",
 };
+
+function policyText(record) {
+  const verification = VERIFY_GUIDANCE[record?.verification] || VERIFY_GUIDANCE.quick;
+  const lines = [
+    '<opencode-decisions-policy>',
+    `Task: ${record?.task || "other"}; risk: ${typeof record?.probability === "number" ? record.probability.toFixed(2) : "unknown"}`,
+    `Verification: ${verification}`,
+  ];
+  if (record?.needsReview) lines.push("Multiple decision models disagreed: obtain human review before high-impact actions.");
+  lines.push('</opencode-decisions-policy>');
+  return lines.join("\n");
+}
+
+function lastAssistantText(messages) {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    const role = message?.info?.role || message?.role;
+    if (role !== "assistant") continue;
+    const parts = message.parts || message.content || [];
+    const text = (Array.isArray(parts) ? parts : [])
+      .map((part) => part?.text || part?.content?.text || "")
+      .filter(Boolean)
+      .join("\n");
+    if (text) return text.slice(0, 2500);
+  }
+  return "";
+}
 
 function first(answers, name) {
   return answer(answers, name);
@@ -145,7 +184,7 @@ function toolQuestion(input) {
   return { type: "predicate", name: "answer", instructions: question };
 }
 
-async function ensemble(ctx, opt, input, questions, ledger, sessionID) {
+async function ensemble(ctx, opt, input, questions, ledger, cache, sessionID) {
   const settled = await Promise.allSettled(
     opt.ensembleModels.map((id) =>
       decide(ctx, {
@@ -154,6 +193,7 @@ async function ensemble(ctx, opt, input, questions, ledger, sessionID) {
         questions,
         timeoutMs: opt.timeoutMs,
         ledger,
+        cache,
         meta: { kind: "ensemble", sessionID, modelID: id },
       }),
     ),
@@ -193,6 +233,17 @@ export default Plugin.define({
     if (opt.enabled === false) return;
 
     const ledger = makeLedger(ctx, opt.ledger);
+    const cache = makeCache(ctx, opt.decisionCache, opt.decisionCacheMs);
+    const cleanups = [];
+
+    const onFailure = (scope, error) => {
+      const message = error?.message || String(error);
+      console.warn(`[opencode-decisions] ${scope} failed ${opt.failureMode}:`, message);
+      if (opt.failureMode === "closed") {
+        return `<opencode-decisions-failure scope="${scope}">Decision subsystem unavailable (${scope}); exercise heightened caution.</opencode-decisions-failure>`;
+      }
+      return "";
+    };
 
     if (opt.rpc !== false) {
       const rpcTokens = loadRpcTokens();
@@ -397,6 +448,7 @@ export default Plugin.define({
           questions,
           timeoutMs: opt.timeoutMs,
           ledger,
+          cache,
           meta: { kind: "prompt", sessionID: event.sessionID },
         });
 
@@ -440,7 +492,15 @@ export default Plugin.define({
 
         let ensembleResult;
         if (opt.ensemble && probability >= opt.highRisk) {
-          ensembleResult = await ensemble(ctx, opt, [{ type: "text", text: described }], questions, ledger, event.sessionID);
+          ensembleResult = await ensemble(
+            ctx,
+            opt,
+            [{ type: "text", text: described }],
+            questions,
+            ledger,
+            cache,
+            event.sessionID,
+          );
         }
 
         await saveRisk(ctx, event.sessionID, {
@@ -501,6 +561,132 @@ export default Plugin.define({
         console.warn("[opencode-decisions] failed open:", error?.message || error);
       }
     });
+
+    if (opt.contextPolicy) {
+      await ctx.session.hook("context", async (event) => {
+        try {
+          const record = await loadRisk(ctx, event.sessionID);
+          if (!record) return;
+          event.system.push({ type: "text", text: policyText(record) });
+        } catch (error) {
+          onFailure("context policy", error);
+        }
+      });
+    }
+
+    if (opt.compactionPolicy) {
+      await ctx.session.hook("compaction", async (event) => {
+        try {
+          const record = await loadRisk(ctx, event.sessionID);
+          event.system.push({
+            type: "text",
+            text: record
+              ? `Preserve this decision policy in the summary. ${policyText(record)}`
+              : "No decision policy was recorded for this session.",
+          });
+        } catch (error) {
+          onFailure("compaction policy", error);
+        }
+      });
+    }
+
+    if (opt.retryPolicy) {
+      await ctx.session.hook("retry", async (event) => {
+        const current = event.decision;
+        try {
+          const status = event.error?.status ?? "n/a";
+          const type = event.error?.type ?? "n/a";
+          const state = [
+            `Provider failure: type=${type} status=${status} attempt=${event.attempt}.`,
+            `Model: ${event.model?.providerID || "?"}/${event.model?.id || "?"}.`,
+            `OpenCode currently proposes ${current?.retry ? "retry" : "no retry"}.`,
+          ].join(" ");
+          const result = await decide(ctx, {
+            input: [{ type: "text", text: state }],
+            questions: [
+              {
+                type: "predicate",
+                name: "retry",
+                instructions: "Should this failed model request be retried?",
+                criteria: {
+                  true: "Transient failure where a retry is likely to succeed",
+                  false: "Permanent failure or retry would not help",
+                },
+              },
+            ],
+            timeoutMs: Math.min(opt.retryDecisionMs, opt.timeoutMs),
+            ledger,
+            meta: { kind: "retry", sessionID: event.sessionID, attempt: event.attempt },
+          });
+          const probability = first(result.answers, "retry")?.probability;
+          if (typeof probability !== "number") return;
+          if (probability >= opt.retryConfidence) {
+            const delay = Number.isFinite(current?.delay) && current.delay >= 0 ? current.delay : 1000;
+            event.decision = { retry: true, delay };
+          } else if (probability <= 1 - opt.retryConfidence) {
+            event.decision = { retry: false };
+          }
+        } catch (error) {
+          onFailure("retry policy", error);
+        }
+      });
+    }
+
+    if (opt.postTaskGate) {
+      const gateController = new AbortController();
+      cleanups.push(() => gateController.abort());
+      void (async () => {
+        try {
+          for await (const event of ctx.event.subscribe({
+            types: ["session.idle"],
+            signal: gateController.signal,
+          })) {
+            const sessionID = event?.data?.sessionID;
+            if (!sessionID) continue;
+            try {
+              const gateKey = `gate/${sessionID}`;
+              const previous = await ctx.storage.get(gateKey);
+              const now = Date.now();
+              if (typeof previous === "number" && now - previous < opt.postTaskGateMs) continue;
+              const record = await loadRisk(ctx, sessionID);
+              if (!record || record.probability < opt.highRisk) continue;
+              const messages = await ctx.session.context({ sessionID });
+              const state = lastAssistantText(messages) || "No assistant summary was available.";
+              await ctx.storage.set(gateKey, now);
+              const result = await decide(ctx, {
+                input: [{ type: "text", text: state }],
+                questions: [
+                  {
+                    type: "predicate",
+                    name: "review",
+                    instructions: "Does this completed high-risk work need human review before being considered done?",
+                    criteria: {
+                      true: "Irreversible or unverified high-impact change",
+                      false: "Change is verified and safe to close out",
+                    },
+                  },
+                ],
+                timeoutMs: opt.timeoutMs,
+                ledger,
+                meta: { kind: "post-task-gate", sessionID },
+              });
+              const probability = first(result.answers, "review")?.probability;
+              if (typeof probability === "number" && probability >= opt.highRisk) {
+                await ctx.session.synthetic({
+                  sessionID,
+                  text: "[opencode-decisions] Post-task review requested before considering this high-risk work complete.",
+                });
+                await ledger.record({ kind: "post-task-gate", sessionID, probability });
+              }
+            } catch (error) {
+              onFailure("post-task gate", error);
+            }
+          }
+        } catch (error) {
+          onFailure("post-task gate subscription", error);
+        }
+      })();
+    }
 
     if (opt.leastPrivilege) {
       await ctx.session.hook("context", async (event) => {
@@ -573,6 +759,7 @@ export default Plugin.define({
                 input: [{ type: "text", text: input.state || question.instructions }],
                 timeoutMs: opt.timeoutMs,
                 ledger,
+                cache,
                 meta: { kind: "tool", sessionID: context.sessionID },
               });
               return { content: JSON.stringify(result.answers[0] || { type: "error", reason: "no answer" }) };
@@ -666,6 +853,7 @@ export default Plugin.define({
                 input: [{ type: "text", text }],
                 timeoutMs: opt.timeoutMs,
                 ledger,
+                cache,
                 meta: { kind: "command", sessionID },
               });
               resultText = `Decision: ${JSON.stringify(result.answers[0] || {})}`;
@@ -704,5 +892,9 @@ export default Plugin.define({
         });
       });
     }
+
+    return () => {
+      for (const cleanup of cleanups) cleanup();
+    };
   },
 });

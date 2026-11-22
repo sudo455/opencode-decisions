@@ -56,6 +56,14 @@ Additional capabilities:
   attachment mention offsets stay valid because the text is only appended to.
 - **HTTP decision RPC** — an external process (e.g. an MCP router) can call any decision model over
   plain HTTP without a Code Mode tool call. See [HTTP decision RPC](#http-decision-rpc).
+- **Decision cache** — identical successful decisions are cached in `ctx.storage` for 60s by default,
+  cutting duplicate calls when several agents/plugins ask the same question.
+- **Context / compaction policy** — the stored risk record is re-sent as a compact system block on
+  every agent-loop model call and included in compaction so it survives summarization.
+- **Retry policy** — on a provider failure, a short-timeout decision can override OpenCode's retry
+  decision; if the decision model is unavailable, OpenCode's built-in decision stands.
+- **Post-task gate** (opt-in) — on `session.idle`, a high-risk session can be checked again and a
+  synthetic review request injected. Cooldown and opt-in defaults keep it quiet.
 
 Credential comes from the OpenCode integration (`ctx.integration.connection.active("opencode")` →
 `resolve()`). **Fail open**: any decision error, missing credential, or timeout is logged as
@@ -111,7 +119,17 @@ background and selection rationale are in [`research/`](research/).
   "agentAllowlist": [],
   "agentFallback": true,
   "highRiskAgent": "plan",
-  "lowRiskAgent": "build"
+  "lowRiskAgent": "build",
+  "decisionCache": true,
+  "decisionCacheMs": 60000,
+  "contextPolicy": true,
+  "compactionPolicy": true,
+  "retryPolicy": true,
+  "retryDecisionMs": 1200,
+  "retryConfidence": 0.6,
+  "postTaskGate": false,
+  "postTaskGateMs": 60000,
+  "failureMode": "open"
 }
 ```
 
@@ -140,6 +158,21 @@ Two layers, so you don't have to type a mode:
 per-model-call hook, and `switchAgent` changes *subsequent requests*. The tool therefore takes effect
 from the next step/request, not instantly inside the current tool call. It does not override an
 explicit `@agent` mention.
+
+### In-session policy hooks
+
+`contextPolicy` and `compactionPolicy` re-inject the saved task/risk/verification record on every
+agent-loop model call and into compaction prompts, so the policy survives long sessions.
+`retryPolicy` asks the decision model (bounded by `retryDecisionMs`) whether a provider failure is
+worth retrying; it only overrides OpenCode's decision when confidence crosses `retryConfidence`,
+and otherwise leaves the built-in decision untouched.
+
+`postTaskGate` is **off by default**. When enabled, it subscribes to `session.idle`; for a session
+whose stored risk is ≥ `highRisk`, it asks whether human review is needed and, if so, injects a
+synthetic review request. A per-session cooldown (`postTaskGateMs`) prevents loops.
+
+All hooks are fail-open by default. Set `failureMode: "closed"` to inject a caution block when the
+decision subsystem is unavailable; this does not block prompts.
 
 ### HTTP decision RPC
 
