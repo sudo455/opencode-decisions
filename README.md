@@ -50,10 +50,15 @@ Additional capabilities:
   [Default subagent delegation](#default-subagent-delegation).
 - **`/decide` command** — asks a yes/no decision question about the supplied prompt text and feeds
   the result back into the session.
-- **Risk gate** — for sensitive tools (`write`, `edit`, `patch`, `bash`) at high risk, calls
-  `ctx.permission.assert`; your permission rules decide whether to allow, ask, or deny.
+- **Unified approval gate** — `riskGate` records per-session risk; a single `ctx.permission.hook("evaluate")`
+  decides `ask`/`deny` for sensitive tools at high risk and for deploy, destructive, credential, and publish
+  operations. The old `permission.assert` path was removed to avoid duplicate prompts.
 - **Least privilege** — when enabled, removes write/edit/patch tools from the model call for
   low-risk `research`, `review`, and `docs` tasks.
+- **Shell gate** — `shell.create.before` marks gated commands via an env var and caps their timeout.
+  It never logs the command and has no session ID, so it cannot read per-session risk.
+- **After-tool audit** — `tool.execute.after` records status and error flags without result text.
+- **Generate policy** — the saved risk policy is also injected into transient `session.generate` calls.
 - **Decision ledger** — every decision, tool call, and ensemble run is stored under `decisions/`
   in `ctx.storage`. Show recent entries with `/decisions-ledger`.
 - **Multi-model ensemble** — high-risk prompts are also sent to the other configured decision
@@ -72,8 +77,9 @@ Additional capabilities:
   synthetic review request injected. Cooldown and opt-in defaults keep it quiet.
 - **Ledger filters / stats / export** — `/decisions-ledger [kind] [limit]`, `/decisions-stats`, and
   `/decisions-export [kind] [limit]`; exported entries are sanitized (no prompt text or error strings).
-- **Audit entries** — permission denials, agent switches, compaction, and decision-subsystem failures
-  are recorded as `kind: "audit"` entries and can be queried through the ledger or RPC.
+- **Audit entries** — approval-gate decisions, shell-gate marks, tool results, agent switches,
+  compaction, and decision-subsystem failures are recorded as `kind: "audit"` entries and can be queried
+  through the ledger or RPC.
 
 Credential comes from the OpenCode integration (`ctx.integration.connection.active("opencode")` →
 `resolve()`). **Fail open**: any decision error, missing credential, or timeout is logged as
@@ -108,8 +114,9 @@ npm test
 ```
 
 It covers ledger sanitization/filters/stats, decision cache TTL and fingerprinting, `decide()` cache/error/ledger
-behavior, per-session risk state, the generic RPC contract, and native subagent agent selection. The RPC contract
-is kept in `lib/rpc-definition.js` so it can be tested without OpenCode's runtime-only `@opencode/plugin/rpc`.
+behavior, per-session risk state, the generic RPC contract, native subagent agent selection, and the pure workflow
+helpers (category matching, approval messages, shell guards, and tool-result audits). The RPC contract is kept in
+`lib/rpc-definition.js` so it can be tested without OpenCode's runtime-only `@opencode/plugin/rpc`.
 
 ### Options
 
@@ -153,7 +160,14 @@ background and selection rationale are in [`research/`](research/).
   "postTaskGateMs": 60000,
   "failureMode": "open",
   "subagentDecision": true,
-  "subagentMaxChoices": 12
+  "subagentMaxChoices": 12,
+  "workflowGates": true,
+  "gateCategories": ["deploy", "destructive", "credentials", "publish"],
+  "approvalEffect": "ask",
+  "shellTimeoutCapMs": 600000,
+  "shellEnv": {},
+  "afterToolAudit": true,
+  "generatePolicy": true
 }
 ```
 
@@ -224,9 +238,10 @@ raw provider responses, or error strings.
 - `/decisions-export [kind] [limit]` emits sanitized JSON.
 - The same data is available over the authenticated RPC via `ledger` and `stats` methods.
 
-Audit entries are recorded for permission denials (`permission-denied`), agent switches
-(`agent-switch`), compaction, retry-policy failures, and subagent-decision failures. Use
-`/decisions-ledger audit` or the RPC `ledger` method with `{"audit":"..."}` to inspect them.
+Audit entries are recorded for approval gates (`approval-gate`), shell gates (`shell-gate`), tool results
+(`tool-completed`/`tool-error`), agent switches (`agent-switch`), compaction, retry-policy failures, and
+subagent-decision failures. Use `/decisions-ledger audit` or the RPC `ledger` method with `{"audit":"..."}`
+to inspect them.
 
 ### HTTP decision RPC
 
@@ -286,8 +301,10 @@ MCP servers; wiring this RPC into one or many MCPs is the router's job.
 - The prompt hook sees the prompt before skills resolve; explicit `@agent` mentions are preserved.
 - Decision calls happen in addition to the router's calls. The free endpoint reports cost 0.
 - The free decision model is limited-time. See [`research/`](research/) before relying on it.
-- The risk gate relies on your permission rules. If no rule matches, `ctx.permission.assert` allows
-  the action; add explicit `ask`/`deny` rules for the actions you want gated.
+- The unified approval gate runs after configured permission rules and only for `allow`/`ask` decisions;
+  an explicit configured `deny` is final. Set `"approvalEffect":"deny"` to block gated operations outright,
+  or keep the default `"ask"` for a human decision. The `fork` hook was not wired because it exposes only
+  the new session ID, not the source session, so risk state cannot be copied safely.
 - Ensemble calls use paid decision models only on high-risk prompts. Set `"ensemble": false` to avoid
   that cost.
 

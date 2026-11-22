@@ -9,6 +9,7 @@ import { makeLedger } from "./lib/ledger.js";
 import { DEFAULT_MODEL, ENSEMBLE_MODELS, FALLBACK_MODEL } from "./lib/models.js";
 import { loadRisk, saveRisk } from "./lib/risk.js";
 import { chooseSubagentAgent } from "./lib/subagent.js";
+import { approvalMessage, gateCategory, shellGuard, shouldGate, toolResultAudit } from "./lib/workflow.js";
 import { Decisions } from "./rpc.js";
 
 const DEFAULT_OPTIONS = {
@@ -50,6 +51,13 @@ const DEFAULT_OPTIONS = {
   failureMode: "open",
   subagentDecision: true,
   subagentMaxChoices: 12,
+  workflowGates: true,
+  gateCategories: ["deploy", "destructive", "credentials", "publish"],
+  approvalEffect: "ask",
+  shellTimeoutCapMs: 600000,
+  shellEnv: {},
+  afterToolAudit: true,
+  generatePolicy: true,
 };
 
 const TASK_TYPES = ["fix", "feature", "refactor", "review", "docs", "research", "other"];
@@ -764,37 +772,78 @@ export default Plugin.define({
       });
     }
 
-    if (opt.riskGate) {
-      await ctx.tool.hook("execute.before", async (event) => {
-        if (!opt.sensitiveTools.includes(event.tool)) return;
+    if (opt.riskGate || opt.workflowGates) {
+      await ctx.permission.hook("evaluate", async (event) => {
+        if (event.effect === "deny") return;
         try {
-          const record = await loadRisk(ctx, event.sessionID);
-          if (!record || record.probability < opt.highRisk) return;
-          await ctx.permission.assert({
+          const record = event.sessionID ? await loadRisk(ctx, event.sessionID) : null;
+          const category = gateCategory(event, opt.gateCategories);
+          const reason = shouldGate(event, opt, record, category);
+          if (!reason) return;
+          event.effect = opt.approvalEffect === "deny" ? "deny" : "ask";
+          event.message = approvalMessage({
+            category: reason,
+            record,
+            action: event.action,
+            opt,
+          });
+          await ledger.record({
+            kind: "audit",
+            audit: "approval-gate",
+            category: reason,
             sessionID: event.sessionID,
             agent: event.agent,
-            source: { type: "tool", messageID: event.messageID, id: event.id },
-            action: event.tool,
-            resources: [event.tool],
-            save: true,
-            metadata: {
-              decisionRisk: record.probability,
-              task: record.task,
-              needsReview: record.needsReview,
-            },
+            action: event.action,
+            resources: Array.isArray(event.resources) ? event.resources : [],
+            source: event.source,
+            effect: event.effect,
+            probability: record?.probability,
           });
         } catch (error) {
-          await ledger
-            .record({
-              kind: "audit",
-              audit: "permission-denied",
-              sessionID: event.sessionID,
-              tool: event.tool,
-              messageID: event.messageID,
-              toolID: event.id,
-            })
-            .catch(() => {});
-          throw error;
+          onFailure("workflow approval gate", error);
+        }
+      });
+    }
+
+    if (opt.workflowGates) {
+      await ctx.shell.hook("create.before", async (event) => {
+        try {
+          const guard = shellGuard(event.command, opt);
+          if (!guard) return;
+          event.env = { ...(event.env || {}), ...guard.env };
+          if (guard.timeout && Number.isFinite(event.timeout) && event.timeout > guard.timeout) {
+            event.timeout = guard.timeout;
+          }
+          await ledger.record({
+            kind: "audit",
+            audit: "shell-gate",
+            category: guard.category,
+            cwd: event.cwd,
+          });
+        } catch (error) {
+          onFailure("shell gate", error);
+        }
+      });
+    }
+
+    if (opt.afterToolAudit) {
+      await ctx.tool.hook("execute.after", async (event) => {
+        try {
+          await ledger.record(toolResultAudit(event));
+        } catch (error) {
+          onFailure("tool result audit", error);
+        }
+      });
+    }
+
+    if (opt.generatePolicy) {
+      await ctx.session.hook("generate", async (event) => {
+        try {
+          if (!Array.isArray(event.system)) return;
+          const record = event.sessionID ? await loadRisk(ctx, event.sessionID) : null;
+          if (record) event.system.push({ type: "text", text: policyText(record) });
+        } catch (error) {
+          onFailure("generate policy", error);
         }
       });
     }
