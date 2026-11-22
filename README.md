@@ -68,6 +68,10 @@ Additional capabilities:
   decision; if the decision model is unavailable, OpenCode's built-in decision stands.
 - **Post-task gate** (opt-in) — on `session.idle`, a high-risk session can be checked again and a
   synthetic review request injected. Cooldown and opt-in defaults keep it quiet.
+- **Ledger filters / stats / export** — `/decisions-ledger [kind] [limit]`, `/decisions-stats`, and
+  `/decisions-export [kind] [limit]`; exported entries are sanitized (no prompt text or error strings).
+- **Audit entries** — permission denials, agent switches, compaction, and decision-subsystem failures
+  are recorded as `kind: "audit"` entries and can be queried through the ledger or RPC.
 
 Credential comes from the OpenCode integration (`ctx.integration.connection.active("opencode")` →
 `resolve()`). **Fail open**: any decision error, missing credential, or timeout is logged as
@@ -190,13 +194,30 @@ and otherwise leaves the built-in decision untouched.
 whose stored risk is ≥ `highRisk`, it asks whether human review is needed and, if so, injects a
 synthetic review request. A per-session cooldown (`postTaskGateMs`) prevents loops.
 
-All hooks are fail-open by default. Set `failureMode: "closed"` to inject a caution block when the
-decision subsystem is unavailable; this does not block prompts.
+All hooks are fail-open by default. Set `failureMode: "closed"` to inject a
+`<opencode-decisions-failure>` block into the prompt instruction and agent-loop system context when
+the decision subsystem is unavailable; this does not block prompts.
+
+### Governance and observability
+
+The ledger stores decisions and audit entries under `decisions/` in `ctx.storage`. Sanitized entries
+contain timestamps, kind, model, latency, numeric answers, and audit metadata — never prompt text,
+raw provider responses, or error strings.
+
+- `/decisions-ledger [kind] [limit]` lists entries, optionally filtered by kind.
+- `/decisions-stats` reports totals, success/error counts, per-kind and per-model counts, and average
+  decision latency.
+- `/decisions-export [kind] [limit]` emits sanitized JSON.
+- The same data is available over the authenticated RPC via `ledger` and `stats` methods.
+
+Audit entries are recorded for permission denials (`permission-denied`), agent switches
+(`agent-switch`), compaction, retry-policy failures, and subagent-decision failures. Use
+`/decisions-ledger audit` or the RPC `ledger` method with `{"audit":"..."}` to inspect them.
 
 ### HTTP decision RPC
 
 For a separate process (e.g. an MCP router), the plugin registers a generic RPC at
-`POST /api/rpc/decisions/choose` and `POST /api/rpc/decisions/models`. It is **not** a new OpenCode tool.
+`POST /api/rpc/decisions/{choose,models,ledger,stats}`. It is **not** a new OpenCode tool.
 Model selection is in the payload, so any model OpenCode reports with `type: "decision"` can be used;
 omitting `model`/`providerID` uses the plugin's configured default.
 
@@ -233,9 +254,12 @@ Response (top-level, no wrapper):
 {"choice":"time-get_current_time","model":"jev-1.13","confidence":1,"probabilities":[]}
 ```
 
-Errors are `decision_failed` (with `reason`), `unsupported_model` (with `model`), and `unauthorized`
-(with `reason`). A returned choice outside `choices` is always `decision_failed` — never invented.
-`models` takes `{"token":"..."}` and returns the list of decision models OpenCode reports.
+Errors are `decision_failed` (with `reason`), `unsupported_model` (with `model`), `ledger_failed`
+(with `reason`), and `unauthorized` (with `reason`). A returned choice outside `choices` is always
+`decision_failed` — never invented. `models` takes `{"token":"..."}` and returns the list of decision
+models OpenCode reports. `ledger` takes `{"token":"...","kind?","audit?","limit?","since?","until?"}`
+and returns sanitized entries. `stats` takes `{"token":"..."}` and returns aggregate counts plus
+average decision latency. All four methods require the same per-client token.
 
 Prompts, tokens, credentials, and raw provider responses are never logged. This plugin does not manage
 MCP servers; wiring this RPC into one or many MCPs is the router's job.

@@ -350,6 +350,40 @@ export default Plugin.define({
             });
           }
         },
+        ledger: async (input, context) => {
+          if (!tokenMatches(rpcTokens, input.token)) {
+            return context.error("unauthorized", "Invalid RPC token", {
+              reason: "missing_or_invalid_token",
+            });
+          }
+          try {
+            return await ledger.query({
+              kind: input.kind,
+              audit: input.audit,
+              limit: input.limit,
+              since: input.since,
+              until: input.until,
+            });
+          } catch (error) {
+            return context.error("ledger_failed", "Ledger unavailable", {
+              reason: error?.message || String(error),
+            });
+          }
+        },
+        stats: async (input, context) => {
+          if (!tokenMatches(rpcTokens, input.token)) {
+            return context.error("unauthorized", "Invalid RPC token", {
+              reason: "missing_or_invalid_token",
+            });
+          }
+          try {
+            return await ledger.stats();
+          } catch (error) {
+            return context.error("ledger_failed", "Ledger stats unavailable", {
+              reason: error?.message || String(error),
+            });
+          }
+        },
       });
     }
 
@@ -560,7 +594,18 @@ export default Plugin.define({
             (ensembleResult ? ` ensemble=${ensembleResult.disagree ? "disagree" : "agree"}` : ""),
         );
       } catch (error) {
-        console.warn("[opencode-decisions] failed open:", error?.message || error);
+        const notice = onFailure("prompt policy", error);
+        if (notice) {
+          try {
+            await ctx.session.instructions.entry.put({
+              sessionID: event.sessionID,
+              key: "opencode-decisions-failure",
+              value: notice,
+            });
+          } catch {
+            // Instruction injection is best-effort; the prompt itself still proceeds.
+          }
+        }
       }
     });
 
@@ -571,7 +616,8 @@ export default Plugin.define({
           if (!record) return;
           event.system.push({ type: "text", text: policyText(record) });
         } catch (error) {
-          onFailure("context policy", error);
+          const notice = onFailure("context policy", error);
+          if (notice) event.system.push({ type: "text", text: notice });
         }
       });
     }
@@ -586,8 +632,14 @@ export default Plugin.define({
               ? `Preserve this decision policy in the summary. ${policyText(record)}`
               : "No decision policy was recorded for this session.",
           });
+          await ledger.record({
+            kind: "audit",
+            audit: record ? "compaction-with-policy" : "compaction-without-policy",
+            sessionID: event.sessionID,
+          });
         } catch (error) {
-          onFailure("compaction policy", error);
+          const notice = onFailure("compaction policy", error);
+          if (notice) event.system.push({ type: "text", text: notice });
         }
       });
     }
@@ -630,6 +682,14 @@ export default Plugin.define({
           }
         } catch (error) {
           onFailure("retry policy", error);
+          await ledger
+            .record({
+              kind: "audit",
+              audit: "retry-policy-failure",
+              sessionID: event.sessionID,
+              attempt: event.attempt,
+            })
+            .catch(() => {});
         }
       });
     }
@@ -723,7 +783,16 @@ export default Plugin.define({
             },
           });
         } catch (error) {
-          console.warn("[opencode-decisions] permission assert failed:", error?.message || error);
+          await ledger
+            .record({
+              kind: "audit",
+              audit: "permission-denied",
+              sessionID: event.sessionID,
+              tool: event.tool,
+              messageID: event.messageID,
+              toolID: event.id,
+            })
+            .catch(() => {});
           throw error;
         }
       });
@@ -773,6 +842,15 @@ export default Plugin.define({
           });
         } catch (error) {
           onFailure("subagent decision", error);
+          await ledger
+            .record({
+              kind: "audit",
+              audit: "subagent-decision-failure",
+              sessionID: event.sessionID,
+              messageID: event.messageID,
+              tool: event.tool,
+            })
+            .catch(() => {});
         }
       });
     }
@@ -876,6 +954,13 @@ export default Plugin.define({
                   reason,
                   sessionID: context.sessionID,
                 });
+                await ledger.record({
+                  kind: "audit",
+                  audit: "agent-switch",
+                  from: context.agent,
+                  agent: target,
+                  sessionID: context.sessionID,
+                });
                 return {
                   content: `Switched to agent '${target}'. The switch applies from the next step/request.`,
                 };
@@ -922,21 +1007,66 @@ export default Plugin.define({
 
         editor.add({
           name: "decisions-ledger",
-          description: "Show recent decisions from the decision ledger",
+          description: "Show recent ledger entries; optional arguments: <kind> <limit>",
           execute: async ({ sessionID, prompt, delivery }) => {
             let text = "Decision ledger unavailable.";
             try {
-              const page = await ledger.recent(opt.ledgerLimit);
+              const tokens = (typeof prompt.text === "string" ? prompt.text.trim() : "").split(/\s+/).filter(Boolean);
+              const kind = tokens.find((token) => !/^\d+$/.test(token));
+              const limit = Number(tokens.find((token) => /^\d+$/.test(token))) || opt.ledgerLimit;
+              const page = await ledger.query({ kind, limit });
               const lines = (page.entries || []).map((entry) => {
-                const value = entry.value || {};
-                const answers = Array.isArray(value.answers)
-                  ? value.answers.map((item) => item.name).join(",")
+                const answers = Array.isArray(entry.answers)
+                  ? entry.answers.map((item) => item.name).join(",")
                   : "";
-                return `${value.at || entry.key} [${value.kind || "?"}] ${value.modelID || value.model?.id || ""} ${answers}`;
+                const model = entry.model
+                  ? `${entry.providerID ? `${entry.providerID}/` : ""}${entry.model}`
+                  : "";
+                const audit = entry.audit ? ` audit=${entry.audit}` : "";
+                return [entry.at, `[${entry.kind}]`, model, audit, answers].filter(Boolean).join(" ");
               });
               text = lines.length ? `Recent decisions:\n${lines.join("\n")}` : "No decisions recorded.";
             } catch (error) {
               text = `Decision ledger unavailable: ${error?.message || error}`;
+            }
+            await ctx.session.prompt({ ...prompt, sessionID, delivery, text });
+          },
+        });
+
+        editor.add({
+          name: "decisions-stats",
+          description: "Show aggregate decision ledger statistics",
+          execute: async ({ sessionID, prompt, delivery }) => {
+            let text = "Decision stats unavailable.";
+            try {
+              const stats = await ledger.stats();
+              text = [
+                `Decision stats: total=${stats.total} success=${stats.successes} error=${stats.errors}`,
+                `By kind: ${JSON.stringify(stats.byKind)}`,
+                `By model: ${JSON.stringify(stats.byModel)}`,
+                `Avg duration: ${stats.avgDurationMs}ms`,
+                `Last: ${stats.lastAt || "n/a"}`,
+              ].join("\n");
+            } catch (error) {
+              text = `Decision stats unavailable: ${error?.message || error}`;
+            }
+            await ctx.session.prompt({ ...prompt, sessionID, delivery, text });
+          },
+        });
+
+        editor.add({
+          name: "decisions-export",
+          description: "Export sanitized ledger entries as JSON; optional arguments: <kind> <limit>",
+          execute: async ({ sessionID, prompt, delivery }) => {
+            let text = "Decision export unavailable.";
+            try {
+              const tokens = (typeof prompt.text === "string" ? prompt.text.trim() : "").split(/\s+/).filter(Boolean);
+              const kind = tokens.find((token) => !/^\d+$/.test(token));
+              const limit = Number(tokens.find((token) => /^\d+$/.test(token))) || opt.ledgerLimit;
+              const page = await ledger.query({ kind, limit: Math.min(200, limit) });
+              text = JSON.stringify(page.entries, null, 2);
+            } catch (error) {
+              text = `Decision export unavailable: ${error?.message || error}`;
             }
             await ctx.session.prompt({ ...prompt, sessionID, delivery, text });
           },
