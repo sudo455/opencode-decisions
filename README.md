@@ -42,6 +42,10 @@ Additional capabilities:
 - **Agent switch tool** — `switch_agent` in the same namespace (Code Mode:
   `tools.decisions.switch_agent`) takes `{ agent, reason? }`. The working model can call it mid-task
   when it decides it needs a different mode. See [Agent switching](#agent-switching).
+- **Default subagent delegation** — OpenCode's built-in `subagent` tool stays in charge of launching
+  and reporting children. When no `agent` is specified, a decision model picks the best subagent type
+  from the live agent catalog; the model stays under OpenCode's normal routing. See
+  [Default subagent delegation](#default-subagent-delegation).
 - **`/decide` command** — asks a yes/no decision question about the supplied prompt text and feeds
   the result back into the session.
 - **Risk gate** — for sensitive tools (`write`, `edit`, `patch`, `bash`) at high risk, calls
@@ -129,7 +133,9 @@ background and selection rationale are in [`research/`](research/).
   "retryConfidence": 0.6,
   "postTaskGate": false,
   "postTaskGateMs": 60000,
-  "failureMode": "open"
+  "failureMode": "open",
+  "subagentDecision": true,
+  "subagentMaxChoices": 12
 }
 ```
 
@@ -158,6 +164,19 @@ Two layers, so you don't have to type a mode:
 per-model-call hook, and `switchAgent` changes *subsequent requests*. The tool therefore takes effect
 from the next step/request, not instantly inside the current tool call. It does not override an
 explicit `@agent` mention.
+
+### Default subagent delegation
+
+This plugin does **not** replace OpenCode's built-in `subagent` tool. It stays in charge of launching
+children, background execution, reports, and model selection. The plugin only adds an `execute.before`
+hook: when the model calls `subagent` **without** an explicit `agent`, the decision model picks the
+best subagent type from the live catalog (`ctx.agent.list()`, mode `subagent` or `all`) and the plugin
+sets `input.agent`. An explicit `agent` always wins. The decision model is given the task prompt but
+never logs it; the ledger stores only the chosen agent id, session, message, and tool id.
+
+`subagentMaxChoices` caps the agent menu (default 12). Set `subagentDecision: false` to disable this
+hook entirely. The delegated child's model remains whatever OpenCode and `@npv12/opencode-jev-router`
+normally select — this plugin does not choose or override it.
 
 ### In-session policy hooks
 

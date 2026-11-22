@@ -47,6 +47,8 @@ const DEFAULT_OPTIONS = {
   retryDecisionMs: 1200,
   retryConfidence: 0.6,
   failureMode: "open",
+  subagentDecision: true,
+  subagentMaxChoices: 12,
 };
 
 const TASK_TYPES = ["fix", "feature", "refactor", "review", "docs", "research", "other"];
@@ -83,9 +85,9 @@ function lastAssistantText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    const role = message?.info?.role || message?.role;
+    const role = message?.info?.role || message?.role || message?.type;
     if (role !== "assistant") continue;
-    const parts = message.parts || message.content || [];
+    const parts = message.parts || message.content || message?.info?.parts || [];
     const text = (Array.isArray(parts) ? parts : [])
       .map((part) => part?.text || part?.content?.text || "")
       .filter(Boolean)
@@ -727,6 +729,54 @@ export default Plugin.define({
       });
     }
 
+    if (opt.subagentDecision) {
+      await ctx.tool.hook("execute.before", async (event) => {
+        if (event.tool !== "subagent") return;
+        const input = event.input;
+        if (!input || typeof input !== "object" || Array.isArray(input)) return;
+        if (typeof input.agent === "string" && input.agent.trim()) return;
+        try {
+          const listed = await ctx.agent.list();
+          const agents = (listed?.data || []).filter(
+            (agent) => agent && !agent.hidden && ["subagent", "all"].includes(agent.mode),
+          );
+          if (!agents.length) return;
+          const choices = agents.slice(0, opt.subagentMaxChoices).map((agent) => ({
+            value: agent.id,
+            description: agent.description || `Agent: ${agent.name || agent.id}`,
+          }));
+          const promptText = typeof input.prompt === "string" ? input.prompt.slice(0, 4000) : "";
+          const result = await decide(ctx, {
+            input: [{ type: "text", text: promptText }],
+            questions: [
+              {
+                type: "choice",
+                name: "agent",
+                instructions: "Which subagent type is best suited to carry out this delegated task?",
+                choices,
+              },
+            ],
+            timeoutMs: opt.timeoutMs,
+            ledger,
+            cache,
+            meta: { kind: "subagent-agent", sessionID: event.sessionID },
+          });
+          const picked = first(result.answers, "agent")?.choice;
+          if (!choices.some((entry) => entry.value === picked)) return;
+          event.input = { ...input, agent: picked };
+          await ledger.record({
+            kind: "subagent-agent",
+            sessionID: event.sessionID,
+            agent: picked,
+            messageID: event.messageID,
+            toolID: event.id,
+          });
+        } catch (error) {
+          onFailure("subagent decision", error);
+        }
+      });
+    }
+
     if (opt.toolDecide) {
       await ctx.tool.transform((editor) => {
         editor.namespace({
@@ -835,6 +885,7 @@ export default Plugin.define({
             },
           });
         }
+
       });
     }
 
