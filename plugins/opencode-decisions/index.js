@@ -8,6 +8,7 @@ import { answer, decide } from "./lib/decide.js";
 import { makeLedger } from "./lib/ledger.js";
 import { DEFAULT_MODEL, ENSEMBLE_MODELS, FALLBACK_MODEL } from "./lib/models.js";
 import { loadRisk, saveRisk } from "./lib/risk.js";
+import { chooseSubagentAgent } from "./lib/subagent.js";
 import { Decisions } from "./rpc.js";
 
 const DEFAULT_OPTIONS = {
@@ -800,58 +801,7 @@ export default Plugin.define({
 
     if (opt.subagentDecision) {
       await ctx.tool.hook("execute.before", async (event) => {
-        if (event.tool !== "subagent") return;
-        const input = event.input;
-        if (!input || typeof input !== "object" || Array.isArray(input)) return;
-        if (typeof input.agent === "string" && input.agent.trim()) return;
-        try {
-          const listed = await ctx.agent.list();
-          const agents = (listed?.data || []).filter(
-            (agent) => agent && !agent.hidden && ["subagent", "all"].includes(agent.mode),
-          );
-          if (!agents.length) return;
-          const choices = agents.slice(0, opt.subagentMaxChoices).map((agent) => ({
-            value: agent.id,
-            description: agent.description || `Agent: ${agent.name || agent.id}`,
-          }));
-          const promptText = typeof input.prompt === "string" ? input.prompt.slice(0, 4000) : "";
-          const result = await decide(ctx, {
-            input: [{ type: "text", text: promptText }],
-            questions: [
-              {
-                type: "choice",
-                name: "agent",
-                instructions: "Which subagent type is best suited to carry out this delegated task?",
-                choices,
-              },
-            ],
-            timeoutMs: opt.timeoutMs,
-            ledger,
-            cache,
-            meta: { kind: "subagent-agent", sessionID: event.sessionID },
-          });
-          const picked = first(result.answers, "agent")?.choice;
-          if (!choices.some((entry) => entry.value === picked)) return;
-          event.input = { ...input, agent: picked };
-          await ledger.record({
-            kind: "subagent-agent",
-            sessionID: event.sessionID,
-            agent: picked,
-            messageID: event.messageID,
-            toolID: event.id,
-          });
-        } catch (error) {
-          onFailure("subagent decision", error);
-          await ledger
-            .record({
-              kind: "audit",
-              audit: "subagent-decision-failure",
-              sessionID: event.sessionID,
-              messageID: event.messageID,
-              tool: event.tool,
-            })
-            .catch(() => {});
-        }
+        await chooseSubagentAgent(ctx, event, opt, { decide, ledger, cache, first, onFailure });
       });
     }
 

@@ -11,7 +11,9 @@ probes, and router vetting.
 ## Contents
 
 - `plugins/opencode-decisions/` — local OpenCode V2 plugin that applies decision policies on each prompt.
+- `tests/` — `node:test` suite for ledger sanitization, cache, decision calls, RPC contract, and subagent selection.
 - `research/` — vetting notes: endpoint probes, candidate routers, and why one was chosen.
+- [`SUMMARY.md`](SUMMARY.md) — concise record of what was built, verified, and intentionally left out.
 
 ## opencode-decisions plugin
 
@@ -96,6 +98,18 @@ opencode plugin list | grep opencode-decisions
 
 On the next prompt you should see an injected `<context key="opencode-decisions">` block (task, risk,
 verification, agent/skill). If the decision service is unavailable, prompts continue normally.
+
+### Tests
+
+The test suite uses Node's built-in test runner — no dependencies to install:
+
+```bash
+npm test
+```
+
+It covers ledger sanitization/filters/stats, decision cache TTL and fingerprinting, `decide()` cache/error/ledger
+behavior, per-session risk state, the generic RPC contract, and native subagent agent selection. The RPC contract
+is kept in `lib/rpc-definition.js` so it can be tested without OpenCode's runtime-only `@opencode/plugin/rpc`.
 
 ### Options
 
