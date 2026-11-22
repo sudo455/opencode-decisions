@@ -19,7 +19,7 @@ predicate / score) with probabilities and confidence. Use it through the decisio
 ### What it does
 
 On each prompt (once, at admission, before skills resolve) it sends the prompt text, attachment names,
-and agent mentions to `ctx.experimental.generate.decisions` with `jev-1.13-free` and asks four questions:
+and agent mentions to `ctx.experimental.generate.decisions` with `jev-1.13-free` and asks:
 
 | Question | Type | Purpose |
 |---|---|---|
@@ -27,14 +27,32 @@ and agent mentions to `ctx.experimental.generate.decisions` with `jev-1.13-free`
 | `risk` | predicate | Risk gate: deployment, production config, credentials, migration, destructive work |
 | `agent` | choice from `ctx.agent.list()` | Suggest/select an agent (unless the prompt already mentions one) |
 | `skill` | choice from `ctx.skill.list()` | Attach a skill (unless already attached) |
+| `ambiguous` | predicate | Ask for clarification when key details are missing |
 
 It then writes an idempotent instruction block via `ctx.session.instructions.entry.put`:
 `<context key="jev-policy">…</context>`. Risk ≥ 0.6 → **thorough** verification, ≥ 0.3 → **standard**,
 else **quick**. High risk means multiple independent passes, live/runtime state and rollback path.
 
+Additional capabilities:
+
+- **Jev as a tool** — `jev_decide` (Code Mode: `tools.jev.decide`) accepts `question`, `type`
+  (`predicate` | `choice` | `score`), `choices`/`levels`, and optional `state`.
+- **`/decide` command** — asks Jev a yes/no question about the supplied prompt text and feeds the
+  result back into the session.
+- **Risk gate** — for sensitive tools (`write`, `edit`, `patch`, `bash`) at high risk, calls
+  `ctx.permission.assert`; your permission rules decide whether to allow, ask, or deny.
+- **Least privilege** — when enabled, removes write/edit/patch tools from the model call for
+  low-risk `research`, `review`, and `docs` tasks.
+- **Decision ledger** — every decision, tool call, and ensemble run is stored under `decisions/`
+  in `ctx.storage`. Show recent entries with `/jev-ledger`.
+- **Multi-model ensemble** — high-risk prompts are also sent to `gpt-6-luna-decision` and
+  `gemini-decision-1`. Disagreement or a confidence split injects "obtain human review".
+- **Prompt clarification** — ambiguous prompts get a clarification directive appended; existing
+  attachment mention offsets stay valid because the text is only appended to.
+
 Credential comes from the OpenCode integration (`ctx.integration.connection.active("opencode")` →
 `resolve()`), the same one used by the router. **Fail open**: any Jev error, missing credential, or
-6 s timeout is logged as `[jev-policy] failed open` and the prompt proceeds unchanged.
+timeout is logged as `[jev-policy] failed open` and the prompt proceeds unchanged.
 
 ### Install
 
@@ -68,7 +86,20 @@ auto-discovery. Defaults:
   "timeoutMs": 6000,
   "highRisk": 0.6,
   "mediumRisk": 0.3,
-  "maxChoices": 12
+  "maxChoices": 12,
+  "toolDecide": true,
+  "commandDecide": true,
+  "ledger": true,
+  "ledgerLimit": 50,
+  "riskGate": true,
+  "leastPrivilege": false,
+  "restrictedTools": ["write", "edit", "patch"],
+  "sensitiveTools": ["write", "edit", "patch", "bash"],
+  "clarify": true,
+  "clarifyThreshold": 0.7,
+  "ensemble": true,
+  "ensembleModels": ["jev-1.13-free", "gpt-6-luna-decision", "gemini-decision-1"],
+  "fallbackModelID": "jev-1.13"
 }
 ```
 
@@ -79,6 +110,11 @@ auto-discovery. Defaults:
   it also never changes the main session model.
 - The prompt hook sees the prompt before skills resolve; explicit `@agent` mentions are preserved.
 - Jev calls happen in addition to the router's Jev calls (the free endpoint reports cost 0).
+- The risk gate relies on your permission rules. If no rule matches, `ctx.permission.assert` allows
+  the action; add explicit `ask`/`deny` rules for the actions you want gated.
+- Ensemble calls use paid decision models (`gpt-6-luna-decision`, `gemini-decision-1`) only on
+  high-risk prompts. Set `"ensemble": false` to avoid that cost.
+- `jev-1.13-free` is limited-time. Set `modelID` to `jev-1.13` when it expires.
 
 ## Related
 
