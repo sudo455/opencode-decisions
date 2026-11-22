@@ -27,7 +27,7 @@ Date: 2026-11-22. Goal: use the free Jev 1.13 decision model with OpenCode v2.3.
 - POST with **no** Authorization header → HTTP 200, real decision returned
   (`is_urgent` noul 0.94, `department` choice=billing confidence 1,
   `usage.cost: 0`, `billing_source: free`).
-- POST with `Authorization: Bearer not-a-real-key` → HTTP 401.
+- POST with `Authorization: <redacted>` → HTTP 401.
 
 Conclusion: the free endpoint needs **no** auth header, but rejects any bogus bearer token. The
 `@typesafe-ai/sdk` used by the first plugin always sends a bearer header, so it needs a real key.
