@@ -108,7 +108,7 @@ background and selection rationale are in [`research/`](research/).
   "rpc": true,
   "rpcTimeoutMs": 6000,
   "switchTool": true,
-  "agentAllowlist": ["build", "plan"],
+  "agentAllowlist": [],
   "agentFallback": true,
   "highRiskAgent": "plan",
   "lowRiskAgent": "build"
@@ -121,17 +121,18 @@ Additional model-related options: `modelID`, `ensembleModels`, `fallbackModelID`
 
 Two layers, so you don't have to type a mode:
 
-1. **Per prompt (already active):** the decision model picks an agent from `agentAllowlist`
-   (default `build` and `plan`). The agent question now states when to pick each: `plan` for design
-   decisions, multi-step work, or high-risk/irreversible changes; `build` for implementation, fixes,
-   and small edits. If the decision model returns `keep`, a model not in the allowlist, or fails,
-   `agentFallback` applies a deterministic rule: high risk (≥ `highRisk`) → `highRiskAgent` (`plan`),
-   otherwise → `lowRiskAgent` (`build`). Explicit `@agent` mentions always win. The injected context
-   block says `Agent selected by decision model: …` or `… by risk fallback: …`.
-   Set `agentAllowlist: []` to expose every primary/all agent instead.
+1. **Per prompt (already active):** the decision model discovers every non-hidden primary/all agent
+   from `ctx.agent.list()` and picks one. By default `agentAllowlist` is `[]` (no hardcoded list), so
+   the whole discovered catalog is offered — all of it, uncapped by `maxChoices` (that limit applies
+   only to skills). Set `agentAllowlist: ["build", "plan"]` to restrict the menu to specific agents.
+   The agent question states when to pick `plan` vs `build` for design/implementation work.
+   If the decision model returns `keep`, an invalid id, or fails, `agentFallback` applies a
+   deterministic rule: high risk (≥ `highRisk`) → `highRiskAgent` (`plan`), otherwise →
+   `lowRiskAgent` (`build`). Explicit `@agent` mentions always win. The injected context block says
+   `Agent selected by decision model: …` or `… by risk fallback: …`.
 2. **Mid-task (model-triggered):** the working model can call `tools.decisions.switch_agent({
-   agent: "plan" | "build", reason: "…" })` when it decides the work needs a different mode. The
-   plugin validates the target against the live agent list and allowlist, calls
+   agent: "<any discovered agent id>", reason: "…" })` when it decides the work needs a different
+   mode. The plugin validates the target against the live agent list (and allowlist, if set), calls
    `ctx.session.switchAgent`, writes an `opencode-decisions-switch` instruction, and records an
    `agent-switch` entry in the ledger.
 

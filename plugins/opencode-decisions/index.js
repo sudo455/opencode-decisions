@@ -32,7 +32,7 @@ const DEFAULT_OPTIONS = {
   rpc: true,
   rpcTimeoutMs: 6000,
   switchTool: true,
-  agentAllowlist: ["build", "plan"],
+  agentAllowlist: [],
   agentFallback: true,
   highRiskAgent: "plan",
   lowRiskAgent: "build",
@@ -320,7 +320,7 @@ export default Plugin.define({
 
     const agentChoices = [
       { value: "keep", description: "Keep the current agent" },
-      ...agents.slice(0, opt.maxChoices).map((agent) => ({
+      ...agents.map((agent) => ({
         value: agent.id,
         description: agent.description || `Agent: ${agent.name || agent.id}`,
       })),
@@ -586,11 +586,11 @@ export default Plugin.define({
           editor.add({
             name: "switch_agent",
             description:
-              "Switch this session to a different agent when the work needs it (e.g. move to Plan to design first, or Build to implement). Takes effect from the next step/request.",
+              "Switch this session to any available agent discovered from the live catalog (e.g. plan to design first, build to implement). Takes effect from the next step/request.",
             input: {
               type: "object",
               properties: {
-                agent: { type: "string", description: "Target agent id, e.g. plan or build" },
+                agent: { type: "string", description: "Target agent id from the live agent catalog" },
                 reason: { type: "string", description: "Why the switch is needed" },
               },
               required: ["agent"],
