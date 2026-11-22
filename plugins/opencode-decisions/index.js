@@ -1,8 +1,13 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Plugin } from "@opencode/plugin";
 import { answer, decide } from "./lib/decide.js";
 import { makeLedger } from "./lib/ledger.js";
 import { DEFAULT_MODEL, ENSEMBLE_MODELS, FALLBACK_MODEL } from "./lib/models.js";
 import { loadRisk, saveRisk } from "./lib/risk.js";
+import { Decisions } from "./rpc.js";
 
 const DEFAULT_OPTIONS = {
   enabled: true,
@@ -24,6 +29,13 @@ const DEFAULT_OPTIONS = {
   ensemble: true,
   ensembleModels: ENSEMBLE_MODELS,
   fallbackModelID: FALLBACK_MODEL,
+  rpc: true,
+  rpcTimeoutMs: 6000,
+  switchTool: true,
+  agentAllowlist: ["build", "plan"],
+  agentFallback: true,
+  highRiskAgent: "plan",
+  lowRiskAgent: "build",
 };
 
 const TASK_TYPES = ["fix", "feature", "refactor", "review", "docs", "research", "other"];
@@ -51,6 +63,61 @@ function first(answers, name) {
 function label(list, id) {
   const item = list.find((entry) => entry.id === id || entry.name === id);
   return item?.name || item?.id || id;
+}
+
+const RPC_TOKENS_FILE = path.join(os.homedir(), ".config", "opencode", "decisions-rpc-tokens.json");
+
+function loadRpcTokens() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RPC_TOKENS_FILE, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => typeof value === "string" && value.length > 0),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function tokenMatches(tokens, presented) {
+  if (typeof presented !== "string" || presented.length === 0) return false;
+  const presentedBytes = Buffer.from(presented, "utf8");
+  return Object.values(tokens).some((expected) => {
+    const expectedBytes = Buffer.from(expected, "utf8");
+    return (
+      expectedBytes.length === presentedBytes.length &&
+      crypto.timingSafeEqual(expectedBytes, presentedBytes)
+    );
+  });
+}
+
+function withDeadline(promise, timeoutMs, signal) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("cancelled"));
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("decision timed out"));
+    }, timeoutMs);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 function toolQuestion(input) {
@@ -127,12 +194,121 @@ export default Plugin.define({
 
     const ledger = makeLedger(ctx, opt.ledger);
 
+    if (opt.rpc !== false) {
+      const rpcTokens = loadRpcTokens();
+      const decisionModels = async () => {
+        const listed = await ctx.model.list({ types: ["decision"] });
+        return (listed?.data || []).map((model) => ({
+          providerID: model.providerID,
+          id: model.id,
+          name: model.name || model.id,
+        }));
+      };
+
+      await ctx.rpc.register(Decisions, {
+        choose: async (input, context) => {
+          if (!tokenMatches(rpcTokens, input.token)) {
+            return context.error("unauthorized", "Invalid RPC token", {
+              reason: "missing_or_invalid_token",
+            });
+          }
+          if (context.signal?.aborted) {
+            return context.error("decision_failed", "Request cancelled", { reason: "cancelled" });
+          }
+
+          const providerID =
+            typeof input.providerID === "string" && input.providerID
+              ? input.providerID
+              : DEFAULT_MODEL.providerID;
+          const id = typeof input.model === "string" && input.model ? input.model : opt.modelID;
+
+          if (id !== opt.modelID || providerID !== DEFAULT_MODEL.providerID) {
+            try {
+              const available = await decisionModels();
+              if (
+                available.length &&
+                !available.some((model) => model.id === id && model.providerID === providerID)
+              ) {
+                return context.error("unsupported_model", "Not a decision model", {
+                  model: `${providerID}/${id}`,
+                });
+              }
+            } catch {
+              // Catalog unavailable: let the endpoint decide.
+            }
+          }
+
+          if (
+            typeof input.question !== "string" ||
+            !input.question.trim() ||
+            !Array.isArray(input.choices) ||
+            input.choices.length < 2 ||
+            input.choices.length > 20
+          ) {
+            return context.error("decision_failed", "Invalid request", { reason: "invalid_input" });
+          }
+
+          try {
+            const result = await withDeadline(
+              ctx.experimental.generate.decisions({
+                model: { providerID, id },
+                input: [{ type: "text", text: typeof input.state === "string" ? input.state : "" }],
+                questions: [
+                  {
+                    type: "choice",
+                    name: "tool",
+                    instructions: input.question,
+                    choices: input.choices.map((value) => ({ value, description: value })),
+                  },
+                ],
+              }),
+              opt.rpcTimeoutMs,
+              context.signal,
+            );
+            const picked = answer(result?.answers, "tool");
+            if (typeof picked?.choice !== "string" || !input.choices.includes(picked.choice)) {
+              return context.error("decision_failed", "Decision returned an invalid choice", {
+                reason: "invalid_choice",
+              });
+            }
+            return {
+              choice: picked.choice,
+              model: id,
+              confidence: typeof picked.confidence === "number" ? picked.confidence : 0,
+              probabilities: Array.isArray(picked.probabilities) ? picked.probabilities : [],
+            };
+          } catch (error) {
+            return context.error("decision_failed", "Decision call failed", {
+              reason: error?.message || String(error),
+            });
+          }
+        },
+        models: async (input, context) => {
+          if (!tokenMatches(rpcTokens, input.token)) {
+            return context.error("unauthorized", "Invalid RPC token", {
+              reason: "missing_or_invalid_token",
+            });
+          }
+          try {
+            return { models: await decisionModels() };
+          } catch (error) {
+            return context.error("decision_failed", "Model catalog unavailable", {
+              reason: error?.message || String(error),
+            });
+          }
+        },
+      });
+    }
+
     let agents = [];
     let skills = [];
     try {
       agents = ((await ctx.agent.list()).data || []).filter(
         (agent) => agent && (agent.mode === "all" || agent.mode === "primary") && !agent.hidden,
       );
+      if (Array.isArray(opt.agentAllowlist) && opt.agentAllowlist.length) {
+        agents = agents.filter((agent) => opt.agentAllowlist.includes(agent.id));
+      }
     } catch (error) {
       console.warn("[opencode-decisions] agent list unavailable:", error?.message || error);
     }
@@ -191,7 +367,8 @@ export default Plugin.define({
         {
           type: "choice",
           name: "agent",
-          instructions: "Which agent is best suited to carry out this request?",
+          instructions:
+            "Which agent is best suited to carry out this request? Choose 'plan' when the request needs design decisions, a multi-step approach, or high-risk/irreversible changes that should be planned before editing. Choose 'build' for straightforward implementation, fixes, and small edits.",
           choices: agentChoices,
         },
         {
@@ -240,10 +417,22 @@ export default Plugin.define({
               ? "standard"
               : "quick";
 
-        const chosenAgent =
+        let chosenAgent =
           typeof agentAnswer?.choice === "string" && agentAnswer.choice !== "keep"
             ? agentAnswer.choice
             : undefined;
+        let agentSource = "decision model";
+        if (
+          (!chosenAgent || !agents.some((agent) => agent.id === chosenAgent)) &&
+          opt.agentFallback
+        ) {
+          chosenAgent = probability >= opt.highRisk ? opt.highRiskAgent : opt.lowRiskAgent;
+          if (agents.some((agent) => agent.id === chosenAgent)) {
+            agentSource = "risk fallback";
+          } else {
+            chosenAgent = undefined;
+          }
+        }
         const chosenSkill =
           typeof skillAnswer?.choice === "string" && skillAnswer.choice !== "none"
             ? skillAnswer.choice
@@ -270,7 +459,7 @@ export default Plugin.define({
         if (chosenAgent && agents.some((agent) => agent.id === chosenAgent)) {
           if (!Array.isArray(prompt.agents) || prompt.agents.length === 0) {
             await ctx.session.switchAgent({ sessionID: event.sessionID, agent: chosenAgent });
-            lines.push(`Agent selected by decision model: ${label(agents, chosenAgent)}`);
+            lines.push(`Agent selected by ${agentSource}: ${label(agents, chosenAgent)}`);
           } else {
             lines.push(`Agent mention preserved; decision model suggested: ${label(agents, chosenAgent)}`);
           }
@@ -392,6 +581,73 @@ export default Plugin.define({
             }
           },
         });
+
+        if (opt.switchTool) {
+          editor.add({
+            name: "switch_agent",
+            description:
+              "Switch this session to a different agent when the work needs it (e.g. move to Plan to design first, or Build to implement). Takes effect from the next step/request.",
+            input: {
+              type: "object",
+              properties: {
+                agent: { type: "string", description: "Target agent id, e.g. plan or build" },
+                reason: { type: "string", description: "Why the switch is needed" },
+              },
+              required: ["agent"],
+              additionalProperties: false,
+            },
+            options: { namespace: "decisions", codemode: true },
+            execute: async (input, context) => {
+              const target = typeof input?.agent === "string" ? input.agent.trim() : "";
+              if (!target) return { content: "A target agent id is required." };
+              try {
+                const listed = await ctx.agent.list();
+                let allowed = (listed?.data || []).filter(
+                  (agent) =>
+                    agent &&
+                    (agent.mode === "all" || agent.mode === "primary") &&
+                    !agent.hidden &&
+                    agent.id === target,
+                );
+                if (Array.isArray(opt.agentAllowlist) && opt.agentAllowlist.length) {
+                  allowed = allowed.filter((agent) => opt.agentAllowlist.includes(agent.id));
+                }
+                if (!allowed.length) {
+                  return { content: `Agent '${target}' is not an available switch target.` };
+                }
+                if (context.agent === target) {
+                  return { content: `Already using agent '${target}'.` };
+                }
+                await ctx.session.switchAgent({ sessionID: context.sessionID, agent: target });
+                const reason = typeof input.reason === "string" ? input.reason.slice(0, 500) : "";
+                await ctx.session.instructions.entry.put({
+                  sessionID: context.sessionID,
+                  key: "opencode-decisions-switch",
+                  value: [
+                    `<opencode-decisions-switch>`,
+                    `Agent switched from ${context.agent} to ${target}.`,
+                    reason ? `Reason: ${reason}` : "",
+                    `</opencode-decisions-switch>`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                });
+                await ledger.record({
+                  kind: "agent-switch",
+                  from: context.agent,
+                  agent: target,
+                  reason,
+                  sessionID: context.sessionID,
+                });
+                return {
+                  content: `Switched to agent '${target}'. The switch applies from the next step/request.`,
+                };
+              } catch (error) {
+                return { content: `Agent switch unavailable: ${error?.message || error}` };
+              }
+            },
+          });
+        }
       });
     }
 

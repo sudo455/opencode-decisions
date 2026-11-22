@@ -26,7 +26,7 @@ and agent mentions to `ctx.experimental.generate.decisions` and asks:
 |---|---|---|
 | `task_type` | choice: fix, feature, refactor, review, docs, research, other | Tailor instructions to the kind of work |
 | `risk` | predicate | Risk gate: deployment, production config, credentials, migration, destructive work |
-| `agent` | choice from `ctx.agent.list()` | Suggest/select an agent (unless the prompt already mentions one) |
+| `agent` | choice from `ctx.agent.list()` | Select an agent (unless the prompt already mentions one); see [Agent switching](#agent-switching) |
 | `skill` | choice from `ctx.skill.list()` | Attach a skill (unless already attached) |
 | `ambiguous` | predicate | Ask for clarification when key details are missing |
 
@@ -39,6 +39,9 @@ Additional capabilities:
 
 - **Decision tool** — `decide` in the `decisions` namespace (Code Mode: `tools.decisions.decide`)
   accepts `question`, `type` (`predicate` | `choice` | `score`), `choices`/`levels`, and optional `state`.
+- **Agent switch tool** — `switch_agent` in the same namespace (Code Mode:
+  `tools.decisions.switch_agent`) takes `{ agent, reason? }`. The working model can call it mid-task
+  when it decides it needs a different mode. See [Agent switching](#agent-switching).
 - **`/decide` command** — asks a yes/no decision question about the supplied prompt text and feeds
   the result back into the session.
 - **Risk gate** — for sensitive tools (`write`, `edit`, `patch`, `bash`) at high risk, calls
@@ -51,6 +54,8 @@ Additional capabilities:
   models. Disagreement or a confidence split injects "obtain human review".
 - **Prompt clarification** — ambiguous prompts get a clarification directive appended; existing
   attachment mention offsets stay valid because the text is only appended to.
+- **HTTP decision RPC** — an external process (e.g. an MCP router) can call any decision model over
+  plain HTTP without a Code Mode tool call. See [HTTP decision RPC](#http-decision-rpc).
 
 Credential comes from the OpenCode integration (`ctx.integration.connection.active("opencode")` →
 `resolve()`). **Fail open**: any decision error, missing credential, or timeout is logged as
@@ -99,11 +104,88 @@ background and selection rationale are in [`research/`](research/).
   "sensitiveTools": ["write", "edit", "patch", "bash"],
   "clarify": true,
   "clarifyThreshold": 0.7,
-  "ensemble": true
+  "ensemble": true,
+  "rpc": true,
+  "rpcTimeoutMs": 6000,
+  "switchTool": true,
+  "agentAllowlist": ["build", "plan"],
+  "agentFallback": true,
+  "highRiskAgent": "plan",
+  "lowRiskAgent": "build"
 }
 ```
 
 Additional model-related options: `modelID`, `ensembleModels`, `fallbackModelID`.
+
+### Agent switching
+
+Two layers, so you don't have to type a mode:
+
+1. **Per prompt (already active):** the decision model picks an agent from `agentAllowlist`
+   (default `build` and `plan`). The agent question now states when to pick each: `plan` for design
+   decisions, multi-step work, or high-risk/irreversible changes; `build` for implementation, fixes,
+   and small edits. If the decision model returns `keep`, a model not in the allowlist, or fails,
+   `agentFallback` applies a deterministic rule: high risk (≥ `highRisk`) → `highRiskAgent` (`plan`),
+   otherwise → `lowRiskAgent` (`build`). Explicit `@agent` mentions always win. The injected context
+   block says `Agent selected by decision model: …` or `… by risk fallback: …`.
+   Set `agentAllowlist: []` to expose every primary/all agent instead.
+2. **Mid-task (model-triggered):** the working model can call `tools.decisions.switch_agent({
+   agent: "plan" | "build", reason: "…" })` when it decides the work needs a different mode. The
+   plugin validates the target against the live agent list and allowlist, calls
+   `ctx.session.switchAgent`, writes an `opencode-decisions-switch` instruction, and records an
+   `agent-switch` entry in the ledger.
+
+**Limitation:** OpenCode V2 does not support a true mid-turn agent swap — `agent` is readonly in every
+per-model-call hook, and `switchAgent` changes *subsequent requests*. The tool therefore takes effect
+from the next step/request, not instantly inside the current tool call. It does not override an
+explicit `@agent` mention.
+
+### HTTP decision RPC
+
+For a separate process (e.g. an MCP router), the plugin registers a generic RPC at
+`POST /api/rpc/decisions/choose` and `POST /api/rpc/decisions/models`. It is **not** a new OpenCode tool.
+Model selection is in the payload, so any model OpenCode reports with `type: "decision"` can be used;
+omitting `model`/`providerID` uses the plugin's configured default.
+
+**Authentication is two layers:**
+
+1. OpenCode server HTTP Basic auth (`opencode` / its generated password). The router must supply it.
+2. A per-client token in the RPC payload. Tokens are read at setup from
+   `~/.config/opencode/decisions-rpc-tokens.json`, e.g.:
+   ```json
+   { "universal-hub": "<token>" }
+   ```
+   Create it without printing the secret:
+   ```bash
+   umask 077 && printf '{"universal-hub":"%s"}\n' "$(openssl rand -hex 32)" > ~/.config/opencode/decisions-rpc-tokens.json
+   ```
+   If the file is missing/empty, or the token is missing/wrong, the RPC returns `unauthorized`.
+
+`choose` request:
+
+```json
+{
+  "question": "Which tool answers: what time is it?",
+  "choices": ["time-get_current_time", "fetch-fetch"],
+  "state": "tool name — tool description ...",
+  "model": "jev-1.13",
+  "providerID": "opencode",
+  "token": "<token>"
+}
+```
+
+Response (top-level, no wrapper):
+
+```json
+{"choice":"time-get_current_time","model":"jev-1.13","confidence":1,"probabilities":[]}
+```
+
+Errors are `decision_failed` (with `reason`), `unsupported_model` (with `model`), and `unauthorized`
+(with `reason`). A returned choice outside `choices` is always `decision_failed` — never invented.
+`models` takes `{"token":"..."}` and returns the list of decision models OpenCode reports.
+
+Prompts, tokens, credentials, and raw provider responses are never logged. This plugin does not manage
+MCP servers; wiring this RPC into one or many MCPs is the router's job.
 
 ### Limits / caveats
 
