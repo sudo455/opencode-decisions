@@ -11,7 +11,7 @@ probes, and router vetting.
 ## Contents
 
 - `plugins/opencode-decisions/` — local OpenCode V2 plugin that applies decision policies on each prompt.
-- `tests/` — `node:test` suite for ledger sanitization, cache, decision calls, RPC contract, and subagent selection.
+- `tests/` — `node:test` suite for ledger sanitization, cache, decision calls, RPC contract, subagent selection, delegation contracts, handoff frames, and workflow gates.
 - `research/` — vetting notes: endpoint probes, candidate routers, and why one was chosen.
 - [`SUMMARY.md`](SUMMARY.md) — concise record of what was built, verified, and intentionally left out.
 
@@ -48,11 +48,20 @@ Additional capabilities:
   and reporting children. When no `agent` is specified, a decision model picks the best subagent type
   from the live agent catalog; the model stays under OpenCode's normal routing. See
   [Default subagent delegation](#default-subagent-delegation).
+- **Delegation contracts** — for each native `subagent` call, the decision model also chooses the
+  narrowest scope (`read-only` / `reversible` / `consequential`). Deterministic policy — not model
+  preference — decides authority: consequential or high-risk work requires a human; read-only and
+  reversible work gets bounded autonomy. The sanitized contract is recorded in the ledger.
+- **Specialist handoff** — `tools.decisions.handoff` and `tools.decisions.return_to_owner` transfer the
+  current session to a specialist and back with a structured, sanitized record (objective, evidence,
+  decisions, files, constraints, outstanding work). Handoff depth is capped. See
+  [Delegation contracts and handoff](#delegation-contracts-and-handoff).
 - **`/decide` command** — asks a yes/no decision question about the supplied prompt text and feeds
   the result back into the session.
 - **Unified approval gate** — `riskGate` records per-session risk; a single `ctx.permission.hook("evaluate")`
-  decides `ask`/`deny` for sensitive tools at high risk and for deploy, destructive, credential, and publish
-  operations. The old `permission.assert` path was removed to avoid duplicate prompts.
+  gates only deterministic high-impact targets (secret files, infra commands, publish/deploy commands) or work
+  whose risk is ≥ `highRisk`. A low-risk category match alone no longer gates, and each tool call is marked so an
+  approval is not requested twice. The old `permission.assert` path was removed.
 - **Least privilege** — when enabled, removes write/edit/patch tools from the model call for
   low-risk `research`, `review`, and `docs` tasks.
 - **Shell gate** — `shell.create.before` marks gated commands via an env var and caps their timeout.
@@ -114,8 +123,9 @@ npm test
 ```
 
 It covers ledger sanitization/filters/stats, decision cache TTL and fingerprinting, `decide()` cache/error/ledger
-behavior, per-session risk state, the generic RPC contract, native subagent agent selection, and the pure workflow
-helpers (category matching, approval messages, shell guards, and tool-result audits). The RPC contract is kept in
+behavior, per-session risk state, the generic RPC contract, native subagent agent selection, delegation contracts
+(scope, authority, least privilege, sanitization), handoff frames and stack push/pop, and the pure workflow helpers
+(category matching, risk-aware approval, shell guards, and tool-result audits). The RPC contract is kept in
 `lib/rpc-definition.js` so it can be tested without OpenCode's runtime-only `@opencode/plugin/rpc`.
 
 ### Options
@@ -164,14 +174,26 @@ background and selection rationale are in [`research/`](research/).
   "workflowGates": true,
   "gateCategories": ["deploy", "destructive", "credentials", "publish"],
   "approvalEffect": "ask",
+  "deterministicFloor": true,
+  "categoryGates": true,
+  "categoryEffect": {},
   "shellTimeoutCapMs": 600000,
   "shellEnv": {},
   "afterToolAudit": true,
-  "generatePolicy": true
+  "generatePolicy": true,
+  "handoffPolicy": true,
+  "delegationPolicy": true,
+  "delegationHighRisk": 0.9,
+  "delegationLowRisk": 0.2
 }
 ```
 
 Additional model-related options: `modelID`, `ensembleModels`, `fallbackModelID`.
+
+Agent allowlists are split by purpose: `autoAgentAllowlist`, `switchAgentAllowlist`, and
+`subagentAllowlist`. When they are unset, the legacy `agentAllowlist` is migrated; the switch list is
+expanded to keep the five specialists reachable. Handoff targets are the live-catalog specialists
+`researcher`, `code-reviewer`, `security-auditor`, `qa-verifier`, and `documentation-reviewer`.
 
 ### Agent switching
 
@@ -209,6 +231,27 @@ never logs it; the ledger stores only the chosen agent id, session, message, and
 `subagentMaxChoices` caps the agent menu (default 12). Set `subagentDecision: false` to disable this
 hook entirely. The delegated child's model remains whatever OpenCode and `@npv12/opencode-jev-router`
 normally select — this plugin does not choose or override it.
+
+### Delegation contracts and handoff
+
+With `delegationPolicy: true` (default), the same `execute.before` hook also asks the decision model
+for the narrowest scope sufficient for the task. `read-only` and `reversible` scopes get bounded
+autonomy; `consequential` scope or a deterministic high-impact target requires a human. The decision
+model cannot upgrade authority on its own: `leastPrivilegeAgent` may downgrade a read-only pick to a
+read-oriented specialist, and a `requires-human` contract suppresses the automatic `agent` rewrite.
+Sanitized contract fields (`task_id`, `scope`, `risk`, `authority`, `correlationId`) are folded into the
+single `subagent-agent` ledger entry.
+
+`handoffPolicy: true` registers two tools in the `decisions` namespace:
+
+- `tools.decisions.handoff({ agent, responsibility, objective?, task_id?, reason? })` validates the
+  target against live specialist agents, switches the session, and writes a structured handoff frame.
+- `tools.decisions.return_to_owner({ findings, outstanding?, escalation? })` pops the frame, returns
+  the session to the previous owner, and publishes the structured result.
+
+Both update an `opencode-decisions-handoff` instruction block and write audit entries. Text is
+sanitized (secret patterns redacted, length capped) before storage. Handoff depth is capped at 5;
+exceeding it returns `handoff-depth-limit` rather than stacking another frame.
 
 ### In-session policy hooks
 
@@ -302,9 +345,11 @@ MCP servers; wiring this RPC into one or many MCPs is the router's job.
 - Decision calls happen in addition to the router's calls. The free endpoint reports cost 0.
 - The free decision model is limited-time. See [`research/`](research/) before relying on it.
 - The unified approval gate runs after configured permission rules and only for `allow`/`ask` decisions;
-  an explicit configured `deny` is final. Set `"approvalEffect":"deny"` to block gated operations outright,
-  or keep the default `"ask"` for a human decision. The `fork` hook was not wired because it exposes only
-  the new session ID, not the source session, so risk state cannot be copied safely.
+  an explicit configured `deny` is final. It is risk-aware: category text alone never gates low-risk work,
+  but a deterministic high-impact target or risk ≥ `highRisk` does. Set `"approvalEffect":"deny"` to block
+  gated operations outright, or keep the default `"ask"` for a human decision. A per-tool-call marker prevents
+  re-asking after approval. The `fork` hook was not wired because it exposes only the new session ID, not the
+  source session, so risk state cannot be copied safely.
 - Ensemble calls use paid decision models only on high-risk prompts. Set `"ensemble": false` to avoid
   that cost.
 

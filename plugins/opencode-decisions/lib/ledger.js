@@ -40,7 +40,7 @@ function cleanEntry(raw) {
       });
   }
 
-  for (const key of ["audit", "agent", "from", "tool", "attempt", "probability"]) {
+  for (const key of ["audit", "agent", "from", "tool", "attempt", "probability", "correlationId", "task_id", "scope", "risk", "authority", "missing", "handoff_id", "responsibility", "depth", "findings", "outstanding", "escalation"]) {
     const candidate = value[key];
     if (candidate === undefined || candidate === null || candidate === "") continue;
     if (typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean") {

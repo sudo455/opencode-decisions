@@ -1,4 +1,5 @@
 // Shared decision caller: cache, timeout, answer parsing, and ledger recording.
+import crypto from "node:crypto";
 import { DEFAULT_MODEL } from "./models.js";
 
 export function answer(answers, name) {
@@ -18,6 +19,7 @@ export async function decide(
   },
 ) {
   const started = Date.now();
+  const correlationId = crypto.randomUUID();
 
   if (cache) {
     const hit = await cache.get(model, questions, input);
@@ -39,6 +41,7 @@ export async function decide(
     if (ledger) {
       await ledger.record({
         ...meta,
+        correlationId,
         model,
         questions: questions.map((q) => ({ type: q.type, name: q.name })),
         answers,
@@ -52,6 +55,7 @@ export async function decide(
     if (ledger) {
       await ledger.record({
         ...meta,
+        correlationId,
         model,
         questions: questions.map((q) => ({ type: q.type, name: q.name })),
         error: error?.message || String(error),

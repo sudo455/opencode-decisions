@@ -9,7 +9,15 @@ import { makeLedger } from "./lib/ledger.js";
 import { DEFAULT_MODEL, ENSEMBLE_MODELS, FALLBACK_MODEL } from "./lib/models.js";
 import { loadRisk, saveRisk } from "./lib/risk.js";
 import { chooseSubagentAgent } from "./lib/subagent.js";
-import { approvalMessage, gateCategory, shellGuard, shouldGate, toolResultAudit } from "./lib/workflow.js";
+import {
+  SPECIALISTS, catalogItems, handoffInstruction, handoffKey, handoffLedgerFields,
+  makeHandoffFrame, newHandoffState, popHandoff, pushHandoff,
+  resolveAllowlists, roleFitQuestions, selectRoleFit, validateHandoffState,
+} from "./lib/handoff.js";
+import {
+  applyGateFailure, approvalMessage, categoryEffect, gateCategoryForEvent,
+  riskProbability, shellGuard, shouldGate, toolReassessment, toolResultAudit,
+} from "./lib/workflow.js";
 import { Decisions } from "./rpc.js";
 
 const DEFAULT_OPTIONS = {
@@ -35,7 +43,15 @@ const DEFAULT_OPTIONS = {
   rpc: true,
   rpcTimeoutMs: 6000,
   switchTool: true,
-  agentAllowlist: [],
+  // Routing controls. Legacy `agentAllowlist` is migrated in setup() to the
+  // auto/switch lists; explicit new lists always win.
+  agentAllowlist: ["plan", "build"],
+  autoAgentAllowlist: undefined,
+  switchAgentAllowlist: undefined,
+  subagentAllowlist: undefined,
+  handoffPolicy: true,
+  roleFitPolicy: true,
+  roleFitMaxDepth: 4,
   agentFallback: true,
   highRiskAgent: "plan",
   lowRiskAgent: "build",
@@ -58,6 +74,25 @@ const DEFAULT_OPTIONS = {
   shellEnv: {},
   afterToolAudit: true,
   generatePolicy: true,
+  // AOEF Stage D additions. Defaults preserve existing behavior except the
+  // deterministic floor, which gates only narrow high-impact targets.
+  deterministicFloor: true,
+  // Authorized AOEF remediation (P0): high-impact workflow categories are
+  // denied outright; advisory-only risk tiers still ask for human approval.
+  categoryEffect: {
+    destructive: "deny",
+    credentials: "deny",
+    deploy: "deny",
+    publish: "deny",
+    "risk-floor": "ask",
+    risk: "ask",
+  },
+  gateFailClosed: true,
+  riskReassess: false,
+  // Decision-driven delegation with least-privilege contracts.
+  delegationPolicy: true,
+  delegationHighRisk: 0.9,
+  delegationLowRisk: 0.2,
 };
 
 const TASK_TYPES = ["fix", "feature", "refactor", "review", "docs", "research", "other"];
@@ -243,6 +278,11 @@ export default Plugin.define({
     const opt = { ...DEFAULT_OPTIONS, ...(ctx.options || {}) };
     if (opt.enabled === false) return;
 
+    const routing = resolveAllowlists(opt);
+    if (routing.migration.length) {
+      console.warn(`[opencode-decisions] migrating agent routing: ${routing.migration.join(", ")}`);
+    }
+
     const ledger = makeLedger(ctx, opt.ledger);
     const cache = makeCache(ctx, opt.decisionCache, opt.decisionCacheMs);
     const cleanups = [];
@@ -397,19 +437,21 @@ export default Plugin.define({
     }
 
     let agents = [];
+    let catalogAgents = [];
     let skills = [];
     try {
-      agents = ((await ctx.agent.list()).data || []).filter(
-        (agent) => agent && (agent.mode === "all" || agent.mode === "primary") && !agent.hidden,
+      const catalog = catalogItems(await ctx.agent.list()).filter((agent) => agent && !agent.hidden);
+      catalogAgents = catalog;
+      agents = catalog.filter(
+        (agent) =>
+          (agent.mode === "all" || agent.mode === "primary") &&
+          routing.auto.includes(agent.id),
       );
-      if (Array.isArray(opt.agentAllowlist) && opt.agentAllowlist.length) {
-        agents = agents.filter((agent) => opt.agentAllowlist.includes(agent.id));
-      }
     } catch (error) {
       console.warn("[opencode-decisions] agent list unavailable:", error?.message || error);
     }
     try {
-      skills = ((await ctx.skill.list()).data || []).filter((skill) => skill && skill.id);
+      skills = catalogItems(await ctx.skill.list()).filter((skill) => skill && skill.id);
     } catch (error) {
       console.warn("[opencode-decisions] skill list unavailable:", error?.message || error);
     }
@@ -421,6 +463,34 @@ export default Plugin.define({
         description: agent.description || `Agent: ${agent.name || agent.id}`,
       })),
     ];
+    const specialistTargets = SPECIALISTS.filter(
+      (id) =>
+        routing.switch.includes(id) &&
+        catalogAgents.some((agent) => agent.id === id && agent.mode === "all"),
+    );
+
+    // Authoritative per-agent lookup: use ctx.agent.get rather than trusting a
+    // setup-time list snapshot, which can be stale after agent discovery.
+    const agentAvailable = async (id, requireAll = false) => {
+      if (typeof id !== "string" || !id) return false;
+      try {
+        const response = await ctx.agent.get({ agentID: id });
+        const agent = response && typeof response === "object" && !Array.isArray(response) && response.data
+          ? response.data
+          : response;
+        if (agent && !agent.hidden && (!requireAll || agent.mode === "all")) return true;
+      } catch {
+        // Fall through to the live list, then the setup snapshot.
+      }
+      let live = catalogAgents;
+      try {
+        live = catalogItems(await ctx.agent.list());
+      } catch (error) {
+        console.warn("[opencode-decisions] live agent catalog lookup failed:", error?.message || error);
+      }
+      return live.some((agent) => agent.id === id && !agent.hidden && (!requireAll || agent.mode === "all"));
+    };
+
     const skillChoices = [
       { value: "none", description: "No skill" },
       ...skills.slice(0, opt.maxChoices).map((skill) => ({
@@ -485,6 +555,9 @@ export default Plugin.define({
           },
         });
       }
+      if (opt.roleFitPolicy && specialistTargets.length && event.agent) {
+        questions.push(...roleFitQuestions(specialistTargets));
+      }
 
       try {
         const result = await decide(ctx, {
@@ -505,8 +578,7 @@ export default Plugin.define({
         const ambiguousAnswer = first(answers, "ambiguous");
 
         const task = TASK_TYPES.includes(taskAnswer?.choice) ? taskAnswer.choice : "other";
-        const probability =
-          typeof riskAnswer?.probability === "number" ? riskAnswer.probability : 0.5;
+        const probability = riskProbability(riskAnswer);
         const verification =
           probability >= opt.highRisk
             ? "thorough"
@@ -555,6 +627,56 @@ export default Plugin.define({
           needsReview: Boolean(ensembleResult?.disagree),
         });
 
+        let handoffNotice = "";
+        if (opt.handoffPolicy && specialistTargets.length && event.sessionID) {
+          const fit = selectRoleFit(answers, specialistTargets);
+          const from = typeof event.agent === "string" && event.agent ? event.agent : undefined;
+          if (fit.target && from && fit.target !== from) {
+            try {
+              const key = handoffKey(event.sessionID);
+              const existing = await ctx.storage.get(key);
+              const originalText = typeof prompt.text === "string" ? prompt.text.slice(0, 1000) : "";
+              const frame = makeHandoffFrame({
+                from,
+                to: fit.target,
+                responsibility: `${task} specialist takeover`,
+                objective: originalText,
+                task,
+                phase: "role-fit takeover",
+                constraints: "Respect AOEF Authority Matrix and all user constraints already established in this session.",
+                authorization: "No authority expansion; no approval bypass; no consequential operation authorized by this handoff.",
+                facts: [`risk=${probability.toFixed(2)}`, `verification=${verification}`],
+                evidence: ["opencode-decisions prompt classification"],
+                decisions: [],
+                files: [],
+                completed: [],
+              });
+              const pushed = pushHandoff(existing, frame, opt.roleFitMaxDepth);
+              if (pushed.error) {
+                handoffNotice = `Specialist handoff suppressed: ${pushed.error}`;
+              } else {
+                await ctx.storage.set(key, pushed.state);
+                await ctx.session.switchAgent({ sessionID: event.sessionID, agent: fit.target });
+                await ctx.session.instructions.entry.put({
+                  sessionID: event.sessionID,
+                  key: "opencode-decisions-handoff",
+                  value: handoffInstruction(pushed.state, pushed.frame),
+                });
+                await ledger.record({
+                  kind: "audit",
+                  audit: "handoff-open",
+                  sessionID: event.sessionID,
+                  ...handoffLedgerFields(pushed.frame),
+                });
+                handoffNotice = `Specialist ${fit.target} took over this session (role fit ${fit.confidence.toFixed(2)}). Return with decisions.return_to_owner.`;
+              }
+            } catch (error) {
+              const notice = onFailure("handoff", error);
+              if (notice) handoffNotice = notice;
+            }
+          }
+        }
+
         const lines = [
           `<opencode-decisions task="${task}" risk="${probability.toFixed(2)}" verification="${verification}">`,
           `Task guidance: ${TASK_GUIDANCE[task]}`,
@@ -591,6 +713,7 @@ export default Plugin.define({
               : "High-risk decision confirmed by multiple decision models.",
           );
         }
+        if (handoffNotice) lines.push(handoffNotice);
 
         lines.push("</opencode-decisions>");
         await ctx.session.instructions.entry.put({
@@ -624,6 +747,15 @@ export default Plugin.define({
           const record = await loadRisk(ctx, event.sessionID);
           if (!record) return;
           event.system.push({ type: "text", text: policyText(record) });
+          if (opt.handoffPolicy && event.sessionID) {
+            const state = await ctx.storage.get(handoffKey(event.sessionID));
+            const frame = Array.isArray(state?.stack) && state.stack.length
+              ? state.stack[state.stack.length - 1]
+              : null;
+            if (frame) {
+              event.system.push({ type: "text", text: handoffInstruction(state, frame) });
+            }
+          }
         } catch (error) {
           const notice = onFailure("context policy", error);
           if (notice) event.system.push({ type: "text", text: notice });
@@ -641,6 +773,18 @@ export default Plugin.define({
               ? `Preserve this decision policy in the summary. ${policyText(record)}`
               : "No decision policy was recorded for this session.",
           });
+          if (opt.handoffPolicy && event.sessionID) {
+            const state = await ctx.storage.get(handoffKey(event.sessionID));
+            const frame = Array.isArray(state?.stack) && state.stack.length
+              ? state.stack[state.stack.length - 1]
+              : null;
+            if (frame) {
+              event.system.push({
+                type: "text",
+                text: `Preserve this active handoff state. ${handoffInstruction(state, frame)}`,
+              });
+            }
+          }
           await ledger.record({
             kind: "audit",
             audit: record ? "compaction-with-policy" : "compaction-without-policy",
@@ -776,11 +920,21 @@ export default Plugin.define({
       await ctx.permission.hook("evaluate", async (event) => {
         if (event.effect === "deny") return;
         try {
+          const sourceID =
+            event.source?.id || (event.messageID && event.id ? `${event.messageID}:${event.id}` : null);
+          const gateKey = event.sessionID && sourceID ? `gate/${event.sessionID}/${sourceID}` : null;
+          if (gateKey) {
+            try {
+              if (await ctx.storage.get(gateKey)) return;
+            } catch {
+              // Storage failures must not silently allow a gated operation.
+            }
+          }
           const record = event.sessionID ? await loadRisk(ctx, event.sessionID) : null;
-          const category = gateCategory(event, opt.gateCategories);
+          const category = gateCategoryForEvent(event, opt.gateCategories);
           const reason = shouldGate(event, opt, record, category);
           if (!reason) return;
-          event.effect = opt.approvalEffect === "deny" ? "deny" : "ask";
+          event.effect = categoryEffect(reason, opt);
           event.message = approvalMessage({
             category: reason,
             record,
@@ -799,7 +953,19 @@ export default Plugin.define({
             effect: event.effect,
             probability: record?.probability,
           });
+          if (gateKey) {
+            try {
+              await ctx.storage.set(gateKey, {
+                at: new Date().toISOString(),
+                effect: event.effect,
+                category: reason,
+              });
+            } catch {
+              // Marker failure is advisory; the gate decision itself already stands.
+            }
+          }
         } catch (error) {
+          await applyGateFailure(event, ledger, opt);
           onFailure("workflow approval gate", error);
         }
       });
@@ -830,6 +996,30 @@ export default Plugin.define({
       await ctx.tool.hook("execute.after", async (event) => {
         try {
           await ledger.record(toolResultAudit(event));
+          if (opt.riskReassess && event.sessionID) {
+            const record = await loadRisk(ctx, event.sessionID);
+            if (record) {
+              const spec = toolReassessment(event)[0];
+              const result = await decide(ctx, {
+                questions: spec.questions,
+                input: spec.input,
+                ledger,
+                cache,
+                meta: { kind: "risk-reassessment", sessionID: event.sessionID },
+              });
+              const next = riskProbability(answer(result.answers, "reassess"));
+              if (next > record.probability) {
+                await saveRisk(ctx, event.sessionID, { ...record, probability: next });
+                await ledger.record({
+                  kind: "audit",
+                  audit: "risk-escalated",
+                  sessionID: event.sessionID,
+                  probability: next,
+                  previous: record.probability,
+                });
+              }
+            }
+          }
         } catch (error) {
           onFailure("tool result audit", error);
         }
@@ -850,7 +1040,12 @@ export default Plugin.define({
 
     if (opt.subagentDecision) {
       await ctx.tool.hook("execute.before", async (event) => {
-        await chooseSubagentAgent(ctx, event, opt, { decide, ledger, cache, first, onFailure });
+        await chooseSubagentAgent(
+          ctx,
+          event,
+          { ...opt, agentAllowlist: routing.subagent },
+          { decide, ledger, cache, first, onFailure },
+        );
       });
     }
 
@@ -900,7 +1095,7 @@ export default Plugin.define({
           editor.add({
             name: "switch_agent",
             description:
-              "Switch this session to any available agent discovered from the live catalog (e.g. plan to design first, build to implement). Takes effect from the next step/request.",
+              "Switch this session to an allowed agent from the live catalog (plan/build primaries and configured specialists). Takes effect from the next step/request.",
             input: {
               type: "object",
               properties: {
@@ -923,9 +1118,7 @@ export default Plugin.define({
                     !agent.hidden &&
                     agent.id === target,
                 );
-                if (Array.isArray(opt.agentAllowlist) && opt.agentAllowlist.length) {
-                  allowed = allowed.filter((agent) => opt.agentAllowlist.includes(agent.id));
-                }
+                allowed = allowed.filter((agent) => routing.switch.includes(agent.id));
                 if (!allowed.length) {
                   return { content: `Agent '${target}' is not an available switch target.` };
                 }
@@ -970,6 +1163,147 @@ export default Plugin.define({
           });
         }
 
+        if (opt.handoffPolicy) {
+          editor.add({
+            name: "handoff",
+            description:
+              "Explicitly hand the current session to a specialist, preserving a structured context record. Targets must be allowed specialists available in the live catalog.",
+            input: {
+              type: "object",
+              properties: {
+                agent: { type: "string", description: "Specialist agent id" },
+                responsibility: { type: "string", description: "Exact responsibility assigned to the specialist" },
+                task_id: { type: "string", description: "Optional existing task id" },
+                objective: { type: "string", description: "Optional original objective" },
+                reason: { type: "string", description: "Why this specialist is needed" },
+              },
+              required: ["agent", "responsibility"],
+              additionalProperties: false,
+            },
+            options: { namespace: "decisions", codemode: true },
+            execute: async (input, context) => {
+              const target = typeof input?.agent === "string" ? input.agent.trim() : "";
+              // Validate against the live catalog at call time: setup-time
+              // snapshots can be stale after config or agent discovery changes.
+              const isTarget =
+                SPECIALISTS.includes(target) &&
+                routing.switch.includes(target) &&
+                (await agentAvailable(target, true));
+              if (!isTarget) return { content: `Agent '${target}' is not an available specialist handoff target.` };
+              if (context.agent === target) return { content: `Already using agent '${target}'.` };
+              try {
+                const key = handoffKey(context.sessionID);
+                const existing = await ctx.storage.get(key);
+                const frame = makeHandoffFrame({
+                  from: context.agent,
+                  to: target,
+                  responsibility: input.responsibility,
+                  taskID: input.task_id,
+                  objective: input.objective,
+                  task: "handoff",
+                  phase: "explicit handoff",
+                  constraints: "Respect AOEF Authority Matrix and all user constraints already established in this session.",
+                  authorization: "No authority expansion; no approval bypass; no consequential operation authorized by this handoff.",
+                  facts: [],
+                  evidence: [],
+                  decisions: [],
+                  files: [],
+                  completed: [],
+                });
+                const pushed = pushHandoff(existing, frame, opt.roleFitMaxDepth);
+                if (pushed.error) return { content: `Handoff refused: ${pushed.error}` };
+                await ctx.storage.set(key, pushed.state);
+                await ctx.session.switchAgent({ sessionID: context.sessionID, agent: target });
+                await ctx.session.instructions.entry.put({
+                  sessionID: context.sessionID,
+                  key: "opencode-decisions-handoff",
+                  value: handoffInstruction(pushed.state, pushed.frame),
+                });
+                await ledger.record({
+                  kind: "audit",
+                  audit: "handoff-open",
+                  sessionID: context.sessionID,
+                  ...handoffLedgerFields(pushed.frame, {
+                    escalation: typeof input.reason === "string" ? input.reason : undefined,
+                  }),
+                });
+                return {
+                  content: `Handoff to ${target} recorded (task ${frame.taskId}, depth ${pushed.frame.depth}). The specialist should call decisions.return_to_owner with its findings.`,
+                };
+              } catch (error) {
+                return { content: `Handoff unavailable: ${error?.message || error}` };
+              }
+            },
+          });
+
+          editor.add({
+            name: "return_to_owner",
+            description:
+              "Return a completed specialist assignment to the previous orchestrator in this same session, with structured findings and outstanding issues.",
+            input: {
+              type: "object",
+              properties: {
+                findings: { type: "string", description: "Structured specialist findings" },
+                outstanding: { type: "string", description: "Outstanding issues, if any" },
+                escalation: { type: "string", description: "Critical escalation, if any" },
+              },
+              required: ["findings"],
+              additionalProperties: false,
+            },
+            options: { namespace: "decisions", codemode: true },
+            execute: async (input, context) => {
+              try {
+                const key = handoffKey(context.sessionID);
+                const state = await ctx.storage.get(key);
+                if (validateHandoffState(state).length) {
+                  return { content: "No valid handoff state exists for this session." };
+                }
+                const popped = popHandoff(state);
+                if (popped.error || !popped.frame) {
+                  return { content: `Handoff return refused: ${popped.error || "no frame"}` };
+                }
+                const owner = popped.frame.from;
+                const ownerValid = await agentAvailable(owner);
+                if (!ownerValid) {
+                  return { content: `Return target '${owner}' is not a valid agent in the live catalog.` };
+                }
+                const frame = {
+                  ...popped.frame,
+                  outstanding: typeof input.outstanding === "string" ? [input.outstanding.slice(0, 600)] : [],
+                  failures: typeof input.escalation === "string" ? [input.escalation.slice(0, 400)] : [],
+                  nextAction: "Integrate specialist findings and continue the original mission.",
+                  state: "returned",
+                };
+                await ctx.storage.set(key, popped.state);
+                await ctx.session.switchAgent({ sessionID: context.sessionID, agent: owner });
+                await ctx.session.instructions.entry.put({
+                  sessionID: context.sessionID,
+                  key: "opencode-decisions-return",
+                  value: handoffInstruction(popped.state, frame, {
+                    findings: input.findings,
+                    outstanding: input.outstanding,
+                    escalation: input.escalation,
+                  }),
+                });
+                await ledger.record({
+                  kind: "audit",
+                  audit: "handoff-return",
+                  sessionID: context.sessionID,
+                  ...handoffLedgerFields(frame, {
+                    findings: input.findings,
+                    outstanding: input.outstanding,
+                    escalation: input.escalation,
+                  }),
+                });
+                return {
+                  content: `Returned to ${owner} with findings (task ${frame.taskId}, remaining depth ${popped.state.stack.length}).`,
+                };
+              } catch (error) {
+                return { content: `Handoff return unavailable: ${error?.message || error}` };
+              }
+            },
+          });
+        }
       });
     }
 
